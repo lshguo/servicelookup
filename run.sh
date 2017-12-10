@@ -1,2 +1,2 @@
 #!/bin/bash
-./servicelookup -kubeconfig=./config-minikube
+./hpa-informer -kubeconfig=/root/.kube/config

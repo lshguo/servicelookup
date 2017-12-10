@@ -11,6 +11,7 @@ import (
 	"k8s.io/client-go/pkg/api"
 	"k8s.io/client-go/pkg/api/errors"
 	"k8s.io/client-go/pkg/api/v1"
+	autoscalev1 "k8s.io/client-go/pkg/apis/autoscaling/v1"
 	"k8s.io/client-go/pkg/apis/extensions/v1beta1"
 	metav1 "k8s.io/client-go/pkg/apis/meta/v1"
 	"k8s.io/client-go/pkg/runtime"
@@ -59,9 +60,66 @@ type serviceLookupController struct {
 	// Watches changes to all pods
 	podController *cache.Controller
 
+	hpaStore   cache.Store
+	hpaController *cache.Controller
+	hpaQueue   workqueue.RateLimitingInterface
+
 	addressToPod   *addressToPod
 	podsQueue      workqueue.RateLimitingInterface
 	endpointsQueue workqueue.RateLimitingInterface
+}
+
+func (slm *serviceLookupController) enqueueHpa(obj interface{}) {
+	key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(obj)
+	if err != nil {
+		fmt.Printf("Couldn't get key for object %+v: %v", obj, err)
+		return
+	}
+	slm.hpaQueue.Add(key)
+}
+
+func (slm *serviceLookupController) updateHpa(oldObj, newObj interface{}) {
+	oldHpa := oldObj.(*autoscalev1.HorizontalPodAutoscaler)
+	newHpa := newObj.(*autoscalev1.HorizontalPodAutoscaler)
+
+	if newHpa.Status.CurrentReplicas == oldHpa.Status.CurrentReplicas {
+		//return
+		fmt.Println("hpa update, but replicas NOT change")
+	}
+	slm.enqueuePod(newObj)
+}
+
+func (slm *serviceLookupController) hpaWorker() {
+	workFunc := func() bool {
+		key, quit := slm.hpaQueue.Get()
+		if quit {
+			return true
+		}
+		defer slm.hpaQueue.Done(key)
+
+		obj, exists, err := slm.hpaStore.GetByKey(key.(string))
+		if !exists {
+			fmt.Printf("Hpa has been deleted %v\n", key)
+			return false
+		}
+		if err != nil {
+			fmt.Printf("cannot get hpa: %v\n", key)
+			return false
+		}
+
+		hpa := obj.(*autoscalev1.HorizontalPodAutoscaler)
+
+		// fmt.Printf("CHAO: podWorker process IP: %s\n", pod.Status.PodIP)
+		//slm.addressToPod.Write(hpa.Status.PodIP, pod)
+		fmt.Printf("hpa %s currentReplicas %d", hpa.GetName(), hpa.Status.CurrentReplicas)
+		return false
+	}
+	for {
+		if quit := workFunc(); quit {
+			fmt.Printf("hpa worker shutting down")
+			return
+		}
+	}
 }
 
 func (slm *serviceLookupController) enqueuePod(obj interface{}) {
@@ -78,6 +136,7 @@ func (slm *serviceLookupController) updatePod(oldObj, newObj interface{}) {
 	newPod := newObj.(*v1.Pod)
 
 	if newPod.Status.PodIP == oldPod.Status.PodIP {
+		fmt.Printf("pod %s changed", newPod.GetName())
 		return
 	}
 	slm.enqueuePod(newObj)
@@ -215,6 +274,9 @@ func newServiceLookupController(kubeconfig string) *serviceLookupController {
 	slm := &serviceLookupController{
 		kubeClient: getClientsetOrDie(kubeconfig),
 		tprClient:  getTPRClientOrDie(kubeconfig),
+
+		hpaQueue:   workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "hpa"),
+
 		podsQueue:  workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "pods"),
 		endpointsQueue: workqueue.NewNamedRateLimitingQueue(
 			workqueue.NewMaxOfRateLimiter(workqueue.NewItemExponentialFailureRateLimiter(100*time.Millisecond, 5*time.Second)), "endpoints"),
@@ -258,6 +320,26 @@ func newServiceLookupController(kubeconfig string) *serviceLookupController {
 			DeleteFunc: slm.enqueueEndpoint,
 		},
 	)
+	slm.hpaStore, slm.hpaController = cache.NewInformer(
+		&cache.ListWatch{
+			ListFunc: func(options v1.ListOptions) (runtime.Object, error) {
+				//return slm.kubeClient.Core().Endpoints(api.NamespaceAll).List(options)
+				return slm.kubeClient.AutoscalingV1().HorizontalPodAutoscalers(api.NamespaceAll).List(options)
+			},
+			WatchFunc: func(options v1.ListOptions) (watch.Interface, error) {
+				//return slm.kubeClient.Core().Endpoints(api.NamespaceAll).Watch(options)
+				return slm.kubeClient.AutoscalingV1().HorizontalPodAutoscalers(api.NamespaceAll).Watch(options)
+			},
+		},
+		&autoscalev1.HorizontalPodAutoscaler{},
+		// resync is not needed
+		0,
+		cache.ResourceEventHandlerFuncs{
+			AddFunc:    slm.enqueueHpa,
+			UpdateFunc: slm.updateHpa,
+			DeleteFunc: slm.enqueueHpa,
+		},
+	)
 	return slm
 }
 
@@ -267,20 +349,24 @@ func (slm *serviceLookupController) Run(workers int, stopCh <-chan struct{}) {
 	fmt.Println("Starting serviceLookupController Manager")
 	slm.registerTPR()
 	go slm.podController.Run(stopCh)
-	go slm.endpointController.Run(stopCh)
+	//go slm.endpointController.Run(stopCh)
+	go slm.hpaController.Run(stopCh)
 	// wait for the controller to List. This help avoid churns during start up.
-	if !cache.WaitForCacheSync(stopCh, slm.podController.HasSynced, slm.endpointController.HasSynced) {
+	//if !cache.WaitForCacheSync(stopCh, slm.podController.HasSynced, slm.endpointController.HasSynced) {
+	if !cache.WaitForCacheSync(stopCh, slm.podController.HasSynced, slm.hpaController.HasSynced) {
 		return
 	}
 	for i := 0; i < workers; i++ {
 		go wait.Until(slm.podWorker, time.Second, stopCh)
-		go wait.Until(slm.endpointWorker, time.Second, stopCh)
+		//go wait.Until(slm.endpointWorker, time.Second, stopCh)
+		go wait.Until(slm.hpaWorker, time.Second, stopCh)
 	}
 
 	<-stopCh
 	fmt.Printf("Shutting down Service Lookup Controller")
 	slm.podsQueue.ShutDown()
-	slm.endpointsQueue.ShutDown()
+	//slm.endpointsQueue.ShutDown()
+	slm.hpaQueue.ShutDown()
 }
 
 func (slm *serviceLookupController) registerTPR() {
