@@ -47,7 +47,10 @@ func main() {
 	var stopCh <-chan struct{}
 	controller.Run(2, stopCh)
 }
-
+//
+//controller 4 要素:
+//client,[(store,controller,queue)]
+//
 type serviceLookupController struct {
 	kubeClient *kubernetes.Clientset
 	tprClient  *podToServiceClient
@@ -86,7 +89,7 @@ func (slm *serviceLookupController) updateHpa(oldObj, newObj interface{}) {
 		//return
 		fmt.Println("hpa update, but replicas NOT change")
 	}
-	slm.enqueuePod(newObj)
+	slm.enqueueHpa(newObj)
 }
 
 func (slm *serviceLookupController) hpaWorker() {
@@ -111,7 +114,7 @@ func (slm *serviceLookupController) hpaWorker() {
 
 		// fmt.Printf("CHAO: podWorker process IP: %s\n", pod.Status.PodIP)
 		//slm.addressToPod.Write(hpa.Status.PodIP, pod)
-		fmt.Printf("hpa %s currentReplicas %d", hpa.GetName(), hpa.Status.CurrentReplicas)
+		fmt.Printf("hpa %s currentReplicas %d\n", hpa.GetName(), hpa.Status.CurrentReplicas)
 		return false
 	}
 	for {
@@ -136,7 +139,7 @@ func (slm *serviceLookupController) updatePod(oldObj, newObj interface{}) {
 	newPod := newObj.(*v1.Pod)
 
 	if newPod.Status.PodIP == oldPod.Status.PodIP {
-		fmt.Printf("pod %s changed", newPod.GetName())
+		fmt.Printf("pod %s changed\n", newPod.GetName())
 		return
 	}
 	slm.enqueuePod(newObj)
